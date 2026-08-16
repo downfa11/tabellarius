@@ -2,6 +2,7 @@ package source
 
 import (
 	"context"
+	"log"
 
 	"github.com/downfa11-org/tabellarius/pkg/inspector"
 	"github.com/downfa11-org/tabellarius/pkg/model"
@@ -22,6 +23,13 @@ func (s *TabellariusSource) Start(ctx context.Context) {
 	}()
 
 	go s.run(ctx, ch)
+}
+
+func (s *TabellariusSource) Close() error {
+	if s != nil && s.pub != nil {
+		return s.pub.Close()
+	}
+	return nil
 }
 
 func (s *TabellariusSource) run(ctx context.Context, in <-chan model.Event) {
@@ -46,7 +54,9 @@ func (s *TabellariusSource) run(ctx context.Context, in <-chan model.Event) {
 			case model.RowChangeEvent:
 				txBuffer[e.TxID()] = append(txBuffer[e.TxID()], e.Changes()...)
 			case *model.BinlogDDLEvent:
-				_ = s.pub.Publish(e)
+				if err := s.pub.Publish(e); err != nil {
+					log.Printf("component=tabellarius_source event=publish_failed tx_id=%q offset=%s error=%q", e.TxID(), e.Offset().String(), err)
+				}
 			case *model.TransactionBoundaryEvent:
 				switch e.Kind() {
 				case model.TxCommit:
@@ -57,7 +67,9 @@ func (s *TabellariusSource) run(ctx context.Context, in <-chan model.Event) {
 					}
 
 					txEvt := model.NewTransactionEvent(lastSource, lastOffset, e.TxID(), changes)
-					_ = s.pub.Publish(txEvt)
+					if err := s.pub.Publish(txEvt); err != nil {
+						log.Printf("component=tabellarius_source event=publish_failed tx_id=%q offset=%s error=%q", e.TxID(), lastOffset.String(), err)
+					}
 					delete(txBuffer, e.TxID())
 
 				case model.TxRollback:

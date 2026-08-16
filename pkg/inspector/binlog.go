@@ -208,19 +208,13 @@ func (b *BinlogInspector) emitRowEvents(out chan<- model.Event, h *replication.E
 	}
 
 	table := fmt.Sprintf("%s.%s", e.Table.Schema, e.Table.Table)
-	if b.currentTxID == "" && !isSystemSchema(e.Table.Schema) {
+	if b.currentTxID == "" {
 		b.currentTxID = fmt.Sprintf("tx:%d", h.LogPos)
 	}
 
 	meta, ok := b.tableMeta[table]
 	if !ok {
-		log.Printf("[binlog] warning: tableMeta missing for %s, generating default columns", table)
-
-		meta = &tableMeta{
-			pkName:  "",
-			pkIndex: 0,
-			columns: make([]string, len(e.Rows[0])),
-		}
+		return
 	}
 
 	offset := model.MySQLOffset{

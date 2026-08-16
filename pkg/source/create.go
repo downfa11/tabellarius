@@ -1,7 +1,7 @@
 package source
 
 import (
-	"log"
+	"fmt"
 
 	"github.com/downfa11-org/tabellarius/pkg/config"
 	"github.com/downfa11-org/tabellarius/pkg/inspector"
@@ -10,29 +10,35 @@ import (
 	"github.com/downfa11-org/tabellarius/pkg/util"
 )
 
-func NewFromConfig(cfg *config.Config) *TabellariusSource {
+func NewFromConfig(cfg *config.Config) (*TabellariusSource, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("config is required")
+	}
+
 	switch cfg.Database.Type {
 	case model.MySQL, model.MariaDB:
-		return NewMySQLSource(cfg.Database.Type, cfg.Database.Schema, cfg.DSN(), cfg.CDCServer.OffsetFile, cfg.CDCServer.PublisherAddr, cfg.Tables)
+		return NewMySQLSource(cfg.Database.Type, cfg.Database.Schema, cfg.DSN(), cfg.CDCServer.OffsetFile, cfg.CDCServer.PublisherConfig, cfg.CDCServer.PublisherAddr, cfg.Tables)
 	case model.Postgres:
-		log.Fatal("postgres source not implemented")
+		return nil, fmt.Errorf("postgres source not implemented")
 	default:
-		log.Fatalf("unsupported database type: %s", cfg.Database.Type)
+		return nil, fmt.Errorf("unsupported database type: %s", cfg.Database.Type)
 	}
-	return nil
 }
 
-func NewMySQLSource(dbType model.DatabaseType, dbSchema, dbDSN string, offsetPath string, pubAddr string, tables []config.Table) *TabellariusSource {
+func NewMySQLSource(dbType model.DatabaseType, dbSchema, dbDSN string, offsetPath, publisherConfigPath, publisherAddr string, tables []config.Table) (*TabellariusSource, error) {
 	binlogOffset := offsetPath + ".binlog"
 	ins, err := inspector.NewBinlogInspector(dbType, dbSchema, dbDSN, binlogOffset, util.GenerateID(), tables)
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("create binlog inspector: %w", err)
 	}
 
-	var inspector inspector.Inspector[model.Event] = ins
+	pub, err := cursus.NewCursusPublisher(publisherConfigPath, publisherAddr)
+	if err != nil {
+		return nil, fmt.Errorf("initialize cursus publisher: %w", err)
+	}
 
 	return &TabellariusSource{
-		ins: inspector,
-		pub: cursus.NewCursusPublisher(pubAddr),
-	}
+		ins: ins,
+		pub: pub,
+	}, nil
 }
