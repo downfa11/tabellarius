@@ -38,7 +38,8 @@ func NewMySQLSource(dbType model.DatabaseType, dbSchema, dbDSN string, offsetPat
 	}
 
 	return &TabellariusSource{
-		ins: ins,
-		pub: pub,
+		ins:        ins,
+		pub:        pub,
+		checkpoint: ins.Checkpoint,
 	}, nil
 }

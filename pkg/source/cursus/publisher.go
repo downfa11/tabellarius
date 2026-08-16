@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cursus-io/cursus/sdk"
@@ -16,8 +17,11 @@ import (
 const legacyDefaultTopic = "tabellarius.cdc"
 
 type Publisher struct {
-	pub publisherClient
-	cfg *sdk.PublisherConfig
+	mu             sync.Mutex
+	pub            publisherClient
+	cfg            *sdk.PublisherConfig
+	failure        error
+	failedSequence uint64
 }
 
 type publisherClient interface {
@@ -32,13 +36,14 @@ type publisherFactory func(*sdk.PublisherConfig) (publisherClient, error)
 type topicProbe func(*sdk.PublisherConfig) error
 
 type eventPayload struct {
-	Type    string            `json:"type"`
-	Source  model.SourceType  `json:"source"`
-	Offset  string            `json:"offset"`
-	TxID    string            `json:"tx_id,omitempty"`
-	Kind    string            `json:"kind,omitempty"`
-	Query   string            `json:"query,omitempty"`
-	Changes []model.RowChange `json:"changes,omitempty"`
+	Type      string            `json:"type"`
+	Source    model.SourceType  `json:"source"`
+	Offset    string            `json:"offset"`
+	Timestamp string            `json:"timestamp"`
+	TxID      string            `json:"tx_id,omitempty"`
+	Kind      string            `json:"kind,omitempty"`
+	Query     string            `json:"query,omitempty"`
+	Changes   []model.RowChange `json:"changes,omitempty"`
 }
 
 // NewCursusPublisher loads the publisher config, ensures its topic is usable,
@@ -187,15 +192,29 @@ func checkTopic(cfg *sdk.PublisherConfig) error {
 }
 
 func (p *Publisher) Close() error {
-	if p != nil && p.pub != nil {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pub != nil {
 		return p.pub.Close()
 	}
 	return nil
 }
 
 func (p *Publisher) Publish(evt model.Event) error {
-	if p == nil || p.pub == nil {
+	if p == nil {
 		return fmt.Errorf("broker publisher not initialized")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.pub == nil {
+		return fmt.Errorf("broker publisher not initialized")
+	}
+	if p.failure != nil {
+		return fmt.Errorf("cursus publisher fenced after sequence=%d failure: %w", p.failedSequence, p.failure)
 	}
 
 	payload, err := marshalEvent(evt)
@@ -206,19 +225,36 @@ func (p *Publisher) Publish(evt model.Event) error {
 	ackCount := p.pub.GetUniqueAckCount()
 	sequence, err := p.pub.PublishMessage(string(payload))
 	if err != nil {
-		log.Printf("component=cursus_publisher event=publish_failed stage=enqueue topic=%q error=%q", p.cfg.Topic, err)
-		return fmt.Errorf("enqueue event for cursus topic %q: %w", p.cfg.Topic, err)
+		fenced := p.fence(sequence, fmt.Errorf("enqueue event for cursus topic %q: %w", p.cfg.Topic, err))
+		log.Printf("component=cursus_publisher event=publish_failed stage=enqueue topic=%q sequence=%d error=%q", p.cfg.Topic, sequence, fenced)
+		return fenced
 	}
 
 	p.pub.Flush()
+	// The SDK exposes an aggregate acknowledgement count rather than a
+	// sequence-specific waiter. Publish is serialized, and any timeout fences
+	// the producer, so no later sequence can mistake a late acknowledgement for
+	// this sequence's acknowledgement.
 	if err := p.waitForAcknowledgement(ackCount + 1); err != nil {
-		log.Printf("component=cursus_publisher event=publish_failed stage=ack topic=%q sequence=%d error=%q", p.cfg.Topic, sequence, err)
-		return err
+		fenced := p.fence(sequence, err)
+		log.Printf("component=cursus_publisher event=publish_failed stage=ack topic=%q sequence=%d error=%q", p.cfg.Topic, sequence, fenced)
+		return fenced
 	}
 
 	log.Printf("component=cursus_publisher event=publish_ack topic=%q sequence=%d source=%s offset=%s type=%T", p.cfg.Topic, sequence, evt.Source(), evt.Offset().String(), evt)
 	p.logPublishedEvent(evt)
 	return nil
+}
+
+func (p *Publisher) fence(sequence uint64, publishErr error) error {
+	if p.failure == nil {
+		p.failure = publishErr
+		p.failedSequence = sequence
+		if err := p.pub.Close(); err != nil {
+			log.Printf("component=cursus_publisher event=close_after_failure_failed topic=%q sequence=%d error=%q", p.cfg.Topic, sequence, err)
+		}
+	}
+	return fmt.Errorf("cursus publisher fenced after sequence=%d failure: %w", p.failedSequence, p.failure)
 }
 
 func (p *Publisher) waitForAcknowledgement(want int) error {
@@ -269,7 +305,11 @@ func (p *Publisher) logPublishedEvent(evt model.Event) {
 }
 
 func marshalEvent(evt model.Event) ([]byte, error) {
-	payload := eventPayload{Source: evt.Source(), Offset: evt.Offset().String()}
+	payload := eventPayload{
+		Source:    evt.Source(),
+		Offset:    evt.Offset().String(),
+		Timestamp: envelopeTimestamp(evt).Format(time.RFC3339Nano),
+	}
 	switch e := evt.(type) {
 	case *model.TransactionBoundaryEvent:
 		payload.Type = "transaction_boundary"
@@ -287,4 +327,16 @@ func marshalEvent(evt model.Event) ([]byte, error) {
 		payload.Type = "unknown"
 	}
 	return json.Marshal(payload)
+}
+
+func envelopeTimestamp(evt model.Event) time.Time {
+	if timestamped, ok := evt.(model.TimestampedEvent); ok {
+		if timestamp := timestamped.Timestamp(); !timestamp.IsZero() {
+			return timestamp.UTC()
+		}
+	}
+
+	fallback := time.Now().UTC()
+	log.Printf("component=cursus_publisher event=timestamp_fallback reason=missing_event_timestamp source=%s offset=%s timestamp=%s", evt.Source(), evt.Offset().String(), fallback.Format(time.RFC3339Nano))
+	return fallback
 }

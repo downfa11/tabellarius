@@ -2,6 +2,7 @@ package inspector
 
 import (
 	"testing"
+	"time"
 
 	"github.com/downfa11-org/tabellarius/pkg/model"
 	"github.com/go-mysql-org/go-mysql/replication"
@@ -74,7 +75,7 @@ func TestEmitRowEvents_ConfiguredTableEmitsOperationsWithPK(t *testing.T) {
 				},
 				Rows: tt.rows,
 			}
-			header := &replication.EventHeader{EventType: tt.eventType, LogPos: 123}
+			header := &replication.EventHeader{EventType: tt.eventType, LogPos: 123, Timestamp: 1786851296}
 
 			b.emitRowEvents(out, header, ev)
 
@@ -86,6 +87,9 @@ func TestEmitRowEvents_ConfiguredTableEmitsOperationsWithPK(t *testing.T) {
 				}
 				if rowEvt.TxID() != "tx-1" {
 					t.Fatalf("unexpected txID: %s", rowEvt.TxID())
+				}
+				if gotTimestamp := rowEvt.Timestamp(); !gotTimestamp.Equal(time.Unix(1786851296, 0).UTC()) {
+					t.Fatalf("row timestamp = %s, want binlog header timestamp", gotTimestamp)
 				}
 				if len(rowEvt.Changes()) != 1 || len(rowEvt.Changes()[0].Rows) != 1 {
 					t.Fatalf("unexpected changes: %#v", rowEvt.Changes())
@@ -194,5 +198,15 @@ func TestEmitRowEvents_SkipsAuditSinkOutsideCaptureAllowList(t *testing.T) {
 	}
 	if b.currentTxID != "tx:124" {
 		t.Fatalf("unexpected transaction ID for audit sink: %s", b.currentTxID)
+	}
+}
+
+func TestBinlogEventTimestampFallsBackWhenHeaderTimestampIsMissing(t *testing.T) {
+	timestamp := binlogEventTimestamp(&replication.EventHeader{LogPos: 123})
+	if timestamp.IsZero() {
+		t.Fatal("fallback timestamp must not be zero")
+	}
+	if timestamp.Location() != time.UTC {
+		t.Fatalf("fallback timestamp location = %s, want UTC", timestamp.Location())
 	}
 }

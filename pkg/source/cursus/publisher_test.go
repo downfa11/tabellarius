@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cursus-io/cursus/sdk"
 	"github.com/downfa11-org/tabellarius/pkg/model"
@@ -15,6 +16,7 @@ import (
 type fakeProducer struct {
 	message          string
 	acked            int
+	publishCalls     int
 	ackOnFlush       bool
 	createTopic      string
 	createPartitions int
@@ -23,8 +25,9 @@ type fakeProducer struct {
 }
 
 func (p *fakeProducer) PublishMessage(message string) (uint64, error) {
+	p.publishCalls++
 	p.message = message
-	return 1, nil
+	return uint64(p.publishCalls), nil
 }
 
 func (p *fakeProducer) CreateTopic(topic string, partitions int) error {
@@ -126,6 +129,65 @@ func TestPublisherReturnsOnlyAfterBrokerAcknowledgement(t *testing.T) {
 	if payload.Type != "transaction" || payload.TxID != "tx-1" || len(payload.Changes) != 1 {
 		t.Fatalf("unexpected published payload: %+v", payload)
 	}
+	assertEnvelopeTimestamp(t, payload.Timestamp)
+}
+
+func TestPublisherTransactionEnvelopeAlwaysContainsTimestamp(t *testing.T) {
+	timestamp := time.Date(2026, time.August, 16, 3, 34, 56, 123456789, time.UTC)
+	tests := []struct {
+		name string
+		op   model.OpType
+		row  model.RowData
+	}{
+		{name: "INSERT", op: model.OpInsert, row: model.RowData{After: map[string]any{"id": 1}}},
+		{name: "UPDATE", op: model.OpUpdate, row: model.RowData{Before: map[string]any{"id": 1}, After: map[string]any{"id": 1, "status": "updated"}}},
+		{name: "DELETE", op: model.OpDelete, row: model.RowData{Before: map[string]any{"id": 1}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fake := &fakeProducer{ackOnFlush: true}
+			publisher := &Publisher{pub: fake, cfg: publisherTestConfig(true)}
+			event := model.NewTransactionEventAt(
+				model.SourceMySQLBinlog,
+				model.MySQLOffset{File: "mysql-bin.000001", Pos: 42},
+				"tx-"+strings.ToLower(tt.name),
+				timestamp,
+				[]model.RowChange{{Schema: "commerce", Table: "revision_history", Op: tt.op, Rows: []model.RowData{tt.row}}},
+			)
+
+			if err := publisher.Publish(event); err != nil {
+				t.Fatalf("Publish() error = %v", err)
+			}
+
+			var payload eventPayload
+			if err := json.Unmarshal([]byte(fake.message), &payload); err != nil {
+				t.Fatalf("published payload is not JSON: %v", err)
+			}
+			got := assertEnvelopeTimestamp(t, payload.Timestamp)
+			if !got.Equal(timestamp) {
+				t.Fatalf("timestamp = %s, want %s", got, timestamp)
+			}
+		})
+	}
+}
+
+func TestPublisherFencesAfterAcknowledgementTimeout(t *testing.T) {
+	fake := &fakeProducer{}
+	publisher := &Publisher{pub: fake, cfg: publisherTestConfig(true)}
+	publisher.cfg.AckTimeoutMS = 1
+	event := model.NewTransactionEvent(model.SourceMySQLBinlog, model.MySQLOffset{File: "mysql-bin.000001", Pos: 42}, "tx-1", nil)
+
+	if err := publisher.Publish(event); err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("expected fenced publisher after acknowledgement timeout, got %v", err)
+	}
+	fake.acked = 1 // Simulate a late acknowledgement for the failed sequence.
+	if err := publisher.Publish(event); err == nil || !strings.Contains(err.Error(), "fenced") {
+		t.Fatalf("expected the fenced publisher to reject the next publish, got %v", err)
+	}
+	if fake.publishCalls != 1 {
+		t.Fatalf("late acknowledgement must not allow a new publish, got %d sends", fake.publishCalls)
+	}
 }
 
 func TestPublisherFailsWhenBrokerDoesNotAcknowledge(t *testing.T) {
@@ -153,4 +215,19 @@ func TestLoadPublisherConfigPreservesSDKConfigShape(t *testing.T) {
 	if cfg.Topic != "commerce.revision-history.v1" || !cfg.AutoCreateTopics || cfg.Partitions != 1 || cfg.BrokerAddrs[0] != "cursus-broker:9000" {
 		t.Fatalf("unexpected publisher config: %+v", cfg)
 	}
+}
+
+func assertEnvelopeTimestamp(t *testing.T, value string) time.Time {
+	t.Helper()
+	if value == "" {
+		t.Fatal("published envelope timestamp is missing")
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		t.Fatalf("timestamp is not RFC3339Nano: %q: %v", value, err)
+	}
+	if timestamp.IsZero() {
+		t.Fatalf("timestamp must not be zero: %q", value)
+	}
+	return timestamp
 }

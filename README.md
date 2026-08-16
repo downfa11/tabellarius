@@ -59,3 +59,5 @@ enable_idempotence: true
 ```
 
 At startup Tabellarius explicitly creates and verifies the configured topic before it begins CDC publishing. When `auto_create_topics: false`, a missing topic is a startup error. A `[publish]` success log is emitted only after the broker acknowledges the event.
+
+Every transaction envelope includes a non-zero `timestamp` formatted as RFC3339Nano in UTC. Tabellarius uses the MySQL binlog header timestamp when available; otherwise it uses the UTC event-creation time and emits a structured fallback log.

@@ -58,10 +58,12 @@ func TestCursusPublisherCreatesTopicPublishesAndConsumerGroupReads(t *testing.T)
 	}
 	t.Logf("topic created: topic=%s offsets=%+v", cfg.Topic, offsets)
 
-	event := model.NewTransactionEvent(
+	timestamp := time.Date(2026, time.August, 16, 3, 34, 56, 123456789, time.UTC)
+	event := model.NewTransactionEventAt(
 		model.SourceMySQLBinlog,
 		model.MySQLOffset{File: "mysql-bin.000001", Pos: 42},
 		"integration-tx-1",
+		timestamp,
 		[]model.RowChange{{
 			Schema: "commerce",
 			Table:  "revision_history",
@@ -107,6 +109,13 @@ func TestCursusPublisherCreatesTopicPublishesAndConsumerGroupReads(t *testing.T)
 		}
 		if payload.TxID != "integration-tx-1" || len(payload.Changes) != 1 || payload.Changes[0].Table != "revision_history" {
 			t.Fatalf("consumer received unexpected payload: %+v", payload)
+		}
+		eventTimestamp, err := time.Parse(time.RFC3339Nano, payload.Timestamp)
+		if err != nil || eventTimestamp.IsZero() {
+			t.Fatalf("consumer received invalid timestamp %q: %v", payload.Timestamp, err)
+		}
+		if !eventTimestamp.Equal(timestamp) {
+			t.Fatalf("consumer timestamp = %s, want %s", eventTimestamp, timestamp)
 		}
 		t.Logf("consumer group received row-change event: offset=%d tx_id=%s", message.Offset, payload.TxID)
 	case err := <-consumerDone:
