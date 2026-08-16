@@ -28,3 +28,36 @@ Change Data Capture Source
    ```
 
 4. Start the Server: `docker compose up cdc-server`
+
+## Capture allow-list
+
+The `tables` entries in the CDC configuration are a strict row-level capture allow-list, not only metadata for primary-key lookup. Tabellarius emits CDC row events only for tables listed there.
+
+Keep consumer-managed audit or sink tables (for example, `revision_history`) out of `tables` unless they are intentionally captured. This prevents writes performed by a CDC consumer from being captured and processed recursively.
+
+Each captured table continues to use its configured `pk` value for primary-key extraction.
+
+## Cursus publisher
+
+Set `cdc_server.publisher_config` to a Cursus SDK publisher YAML file. The existing `publisher_addr` setting remains supported as a legacy fallback, using the default `tabellarius.cdc` topic with automatic creation enabled.
+
+```yaml
+cdc_server:
+  offset_file: offset.txt
+  publisher_config: /config.yaml
+```
+
+```yaml
+# /config.yaml
+broker_addrs:
+  - cursus-broker:9000
+topic: commerce.revision-history.v1
+auto_create_topics: true
+partitions: 1
+acks: "1"
+enable_idempotence: true
+```
+
+At startup Tabellarius explicitly creates and verifies the configured topic before it begins CDC publishing. When `auto_create_topics: false`, a missing topic is a startup error. A `[publish]` success log is emitted only after the broker acknowledges the event.
+
+Every transaction envelope includes a non-zero `timestamp` formatted as RFC3339Nano in UTC. Tabellarius uses the MySQL binlog header timestamp when available; otherwise it uses the UTC event-creation time and emits a structured fallback log.

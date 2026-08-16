@@ -65,6 +65,30 @@ func NewBinlogInspector(dbType model.DatabaseType, schema, dsn, offsetPath strin
 	return b, nil
 }
 
+// Checkpoint persists an acknowledged downstream offset. The source calls this
+// only after Cursus acknowledges the corresponding CDC event.
+func (b *BinlogInspector) Checkpoint(offset model.Offset) error {
+	mysqlOffset, ok := offset.(model.MySQLOffset)
+	if !ok {
+		return fmt.Errorf("binlog checkpoint requires MySQL offset, got %T", offset)
+	}
+	return util.SaveJSON(b.offsetPath, mysqlOffset)
+}
+
+func binlogEventTimestamp(h *replication.EventHeader) time.Time {
+	if h != nil && h.Timestamp != 0 {
+		return time.Unix(int64(h.Timestamp), 0).UTC()
+	}
+
+	logPos := uint32(0)
+	if h != nil {
+		logPos = h.LogPos
+	}
+	fallback := time.Now().UTC()
+	log.Printf("component=binlog_inspector event=timestamp_fallback reason=missing_header_timestamp log_pos=%d timestamp=%s", logPos, fallback.Format(time.RFC3339Nano))
+	return fallback
+}
+
 func (b *BinlogInspector) Start(ctx context.Context, out chan<- model.Event) error {
 	log.Printf("[binlog] connect %s@%s:%d", b.user, b.host, b.port)
 
@@ -128,7 +152,7 @@ func (b *BinlogInspector) Start(ctx context.Context, out chan<- model.Event) err
 						File: b.currentFile,
 						Pos:  ev.Header.LogPos,
 					}
-					out <- model.NewBinlogDDLEvent(src, offset, b.currentTxID, query)
+					out <- model.NewBinlogDDLEventAt(src, offset, b.currentTxID, binlogEventTimestamp(ev.Header), query)
 				} else {
 					if b.currentTxID == "" {
 						b.currentTxID = fmt.Sprintf("query:%d", ev.Header.LogPos)
@@ -153,10 +177,7 @@ func (b *BinlogInspector) Start(ctx context.Context, out chan<- model.Event) err
 						File: b.currentFile,
 						Pos:  ev.Header.LogPos,
 					}
-					out <- model.NewTransactionBoundaryEvent(model.SourceType(b.dbType), offset, b.currentTxID, model.TxCommit)
-					if err := util.SaveJSON(b.offsetPath, offset); err != nil {
-						log.Printf("[binlog] failed to save offset: %v", err)
-					}
+					out <- model.NewTransactionBoundaryEventAt(model.SourceType(b.dbType), offset, b.currentTxID, model.TxCommit, binlogEventTimestamp(ev.Header))
 					b.currentTxID = ""
 				}
 			default:
@@ -208,19 +229,13 @@ func (b *BinlogInspector) emitRowEvents(out chan<- model.Event, h *replication.E
 	}
 
 	table := fmt.Sprintf("%s.%s", e.Table.Schema, e.Table.Table)
-	if b.currentTxID == "" && !isSystemSchema(e.Table.Schema) {
+	if b.currentTxID == "" {
 		b.currentTxID = fmt.Sprintf("tx:%d", h.LogPos)
 	}
 
 	meta, ok := b.tableMeta[table]
 	if !ok {
-		log.Printf("[binlog] warning: tableMeta missing for %s, generating default columns", table)
-
-		meta = &tableMeta{
-			pkName:  "",
-			pkIndex: 0,
-			columns: make([]string, len(e.Rows[0])),
-		}
+		return
 	}
 
 	offset := model.MySQLOffset{
@@ -272,7 +287,7 @@ func (b *BinlogInspector) emitRowEvents(out chan<- model.Event, h *replication.E
 	}
 
 	if len(rowsData) > 0 {
-		out <- model.NewBinlogRowEvent(src, offset, b.currentTxID, []model.RowChange{
+		out <- model.NewBinlogRowEventAt(src, offset, b.currentTxID, binlogEventTimestamp(h), []model.RowChange{
 			{Schema: schema, Table: tableName, Op: op, Rows: rowsData},
 		})
 	}

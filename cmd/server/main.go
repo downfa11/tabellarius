@@ -39,7 +39,10 @@ func main() {
 		log.Fatalf("[FATAL] cdc_log table not found. bootstrap required")
 	}
 
-	src := source.NewFromConfig(cfg)
+	src, err := source.NewFromConfig(cfg)
+	if err != nil {
+		log.Fatalf("[FATAL] failed to initialize source: %v", err)
+	}
 	ctx := context.Background()
 	src.Start(ctx)
 

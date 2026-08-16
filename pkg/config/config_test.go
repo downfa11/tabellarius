@@ -29,6 +29,7 @@ tables:
 cdc_server:
   offset_file: offset.txt
   publisher_addr: localhost:9092
+  publisher_config: publisher.yaml
 `
 
 	tmp, err := os.CreateTemp("", "config-*.yaml")
@@ -61,6 +62,9 @@ cdc_server:
 
 	if cfg.CDCServer.OffsetFile != "offset.txt" {
 		t.Fatalf("unexpected offset file: %s", cfg.CDCServer.OffsetFile)
+	}
+	if cfg.CDCServer.PublisherConfig != "publisher.yaml" {
+		t.Fatalf("unexpected publisher config: %s", cfg.CDCServer.PublisherConfig)
 	}
 }
 
